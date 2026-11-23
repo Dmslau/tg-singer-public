@@ -1,0 +1,126 @@
+name: Scheduled Task
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Fetch external config
+        env:
+          GH_TOKEN: ${{ secrets.CONFIG_TOKEN }}
+        run: |
+          for f in account1.json account2.json; do
+            gh api "repos/Dmslau/tg-singer-private/contents/${f}" \
+              --jq '.content' | base64 -d > "${f}"
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip3 install --force-reinstall tg-signer kurigram==2.2.26
+
+      - name: Execute tasks
+        id: tasks
+        run: |
+          set +e
+          set +o pipefail
+          > /tmp/task_results.txt
+
+          for config_file in account*.json; do
+            if [ ! -f "$config_file" ]; then
+              break
+            fi
+
+            account_name=$(basename "$config_file" .json)
+            session_string=$(jq -r '.session_string' "$config_file")
+            task_map=$(jq -c '.task_map' "$config_file")
+
+            if [ -z "$session_string" ] || [ "$session_string" = "null" ]; then
+              continue
+            fi
+            if [ -z "$task_map" ] || [ "$task_map" = "null" ]; then
+              continue
+            fi
+
+            rm -rf .signer
+            mkdir -p .signer
+
+            echo "$task_map" | jq -r 'to_entries[] | "\(.key)\t\(.value | tojson)"' | while IFS=$'\t' read -r key value_json; do
+              task_path=".signer/signs/${key}"
+              mkdir -p "${task_path}"
+              config_name="${task_path}/config.json"
+              echo "$value_json" | jq . > "$config_name"
+
+              printf 'n\n' | tg-signer --session-string "$session_string" --workdir .signer run-once "${key}" > "/tmp/run_${account_name}_${key}.log" 2>&1
+              exit_code=$?
+
+              if [ $exit_code -eq 0 ]; then
+                status="ok"
+              else
+                status="failed"
+              fi
+
+              echo "[${account_name}] ${key} : ${status}" >> /tmp/task_results.txt
+            done
+          done
+
+          if [ -f /tmp/task_results.txt ] && [ -s /tmp/task_results.txt ]; then
+            summary=$(cat /tmp/task_results.txt)
+          else
+            summary="no tasks executed"
+          fi
+
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$summary" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send notification
+        if: always()
+        env:
+          NOTIFY_KEY: ${{ secrets.NOTIFY_KEY }}
+        run: |
+          SUMMARY="${{ steps.tasks.outputs.summary }}"
+          TITLE="Scheduled Task Report"
+          BODY=$(echo "$SUMMARY" | sed ':a;N;$!ba;s/\n/\\n/g')
+
+          if [ -z "$NOTIFY_KEY" ]; then
+            exit 0
+          fi
+
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -G "https://api.day.app/${NOTIFY_KEY}" \
+            --data-urlencode "title=${TITLE}" \
+            --data-urlencode "body=${BODY}" \
+            --data-urlencode "group=GitHub Actions" \
+            --data-urlencode "sound=alert" \
+            --data-urlencode "icon=https://github.githubassets.com/favicons/favicon.png")
+
+          HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "notification failed"
+          fi
+
+      - name: Keepalive
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git commit --allow-empty -m "auto keepalive"
+          git push origin main
